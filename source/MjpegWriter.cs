@@ -28,6 +28,5 @@ namespace GitHub.secile.Avi
         {
             aviWriter.Close();
         }
-
     }
 }
