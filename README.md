@@ -1,7 +1,7 @@
 # MotionJPEGWriter
 C# source code for creating Motion JPEG file.
 
-```
+```C
 var dialog = new OpenFileDialog() { Multiselect = true };
 dialog.Filter = "Image Files (*.bmp, *.jpg, *.png)|*.bmp;*.jpg;*.png";
 if (dialog.ShowDialog() == DialogResult.OK)
