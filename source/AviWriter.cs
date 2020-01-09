@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -12,13 +12,39 @@ namespace GitHub.secile.Avi
     /// </summary>
     public class AviWriter
     {
-        private event Action<byte[]> OnAddImage;
-        public void AddImage(byte[] data) { OnAddImage(data); }
+        public Action<byte[]> AddImage { get; private set; }
+        public Action<byte[]> AddAudio { get; private set; }
+        public Action Close { get; private set; }
 
-        private event Action OnClose;
-        public void Close() { OnClose(); }
+        public class VideoFormat
+        {
+            public int Width { get; set; }
+            public int Height { get; set; }
+            public float FramesPerSec { get; set; }
+        }
 
+        public class AudioFormat
+        {
+            /// <summary>1 or 2.</summary>
+            public short Channels { get; set; }
+
+            /// <summary>8000, 11025, 22050, 44100, etc...</summary>
+            public int SamplesPerSec { get; set; }
+
+            /// <summary>8 or 16.</summary>
+            public short BitsPerSample { get; set; }
+        }
+
+        /// <summary>Create with video stream.</summary>
         public AviWriter(System.IO.Stream outputAvi, string fourCC, int width, int height, float fps)
+            : this(outputAvi, fourCC, new VideoFormat() { Width = width, Height = height, FramesPerSec = fps }) { }
+
+        /// <summary>Create with video stream.</summary>
+        public AviWriter(System.IO.Stream outputAvi, string fourCC, VideoFormat videoFormat)
+            : this(outputAvi, fourCC, videoFormat, null) { }
+
+        /// <summary>Create with video and audio stream.</summary>
+        public AviWriter(System.IO.Stream outputAvi, string fourCC, VideoFormat videoFormat, AudioFormat audioFormat)
         {
             // RIFFファイルは、RIFFヘッダーとその後ろに続く 0個以上のリストとチャンクで構成されている。
             // RIFFヘッダーは、'RIFF'のFOURCC、4バイトのデータサイズ、データを識別するFOURCC、データから構成されている。
@@ -29,22 +55,31 @@ namespace GitHub.secile.Avi
 
             var riffFile = new RiffFile(outputAvi, "AVI ");
 
-            // hdrlリストを仮のフレーム数で作成
+            // hdrlリストをとりあえずフレーム数=0で作成(あとで上書き)
             var hdrlList = riffFile.CreateList("hdrl");
-            WriteHdrlList(hdrlList, fourCC, width, height, fps, 1);
+            WriteHdrlList(hdrlList, fourCC, videoFormat, audioFormat, 0, 0);
             hdrlList.Close();
 
-            // moviリストを作成し、OnAddImageごとにデータチャンクを追加
+            // moviリストを作成し、AddImage/AddAudioごとにデータチャンクを追加
             var idx1List = new List<Idx1Entry>();
             var moviList = riffFile.CreateList("movi");
-            this.OnAddImage += (data) =>
+            
+            this.AddImage += (data) =>
             {
+                if (videoFormat == null) throw new InvalidOperationException("no video stream.");
                 var idx1 = WriteMoviList(moviList, "00dc", data);
                 idx1List.Add(idx1);
             };
 
+            this.AddAudio += (data) =>
+            {
+                if (audioFormat == null) throw new InvalidOperationException("no audio stream.");
+                var idx1 = WriteMoviList(moviList, "01wb", data);
+                idx1List.Add(idx1);
+            };
+
             // ファイルをクローズ
-            this.OnClose += () =>
+            this.Close += () =>
             {
                 // moviリストを閉じる
                 moviList.Close();
@@ -52,11 +87,14 @@ namespace GitHub.secile.Avi
                 // idx1チャンクを作成
                 WriteIdx1Chunk(riffFile, idx1List);
 
+                var videoFrames = idx1List.Where(x => x.ChunkId == "00dc").Count();
+                var audioFrames = idx1List.Where(x => x.ChunkId == "01wb").Count();
+
                 // hdrlListを正しいフレーム数で上書き
                 var offset = hdrlList.Offset;
                 riffFile.BaseStream.Seek(offset, System.IO.SeekOrigin.Begin); // hdrlリストの先頭まで戻る
                 riffFile.BaseStream.Seek(12, System.IO.SeekOrigin.Current);   // hdrlリストのヘッダ分飛ばす
-                WriteHdrlList(riffFile, fourCC, width, height, fps, idx1List.Count);  // hdrlリストのデータを正しいフレーム数で上書き
+                WriteHdrlList(riffFile, fourCC, videoFormat, audioFormat, videoFrames, audioFrames);  // hdrlリストのデータを正しいフレーム数で上書き
                 riffFile.BaseStream.Seek(0, System.IO.SeekOrigin.End);        // 元の場所に戻る
 
                 // ファイルをクローズ
@@ -65,26 +103,55 @@ namespace GitHub.secile.Avi
             };
         }
 
-        private void WriteHdrlList(RiffList hdrlList, string fourCC, int width, int height, float fps, int frames)
+        /// <summary>Create Hdrl</summary>
+        private void WriteHdrlList(RiffList hdrlList, string fourCC, VideoFormat videoFormat, AudioFormat audioFormat, int videoFrames, int audioFrames)
         {
-            int streams = 1; // ストリーム数。音声なしの場合1。ありの場合2。
+            // - xxxx.avi - RIFF - AVI
+            //   |
+            //   - LIST - hdrl         : Header List
+            //   | |
+            //   | |-- avih            : Main AVI Header 
+            //   | |
+            //   | |-- LIST - strl     : Stream Header List
+            //   | |   |-- strh        : Stream Header
+            //   | |   +-- strf        : BITMAPINFOHEADER
+            //   | |
+            //   | +-- LIST - strl     : Stream Header List
+            //   |     |-- strh        : Stream Header
+            //   |     +-- strf        : WAVEFORMATEX
+            //   |
+            //   - LIST - movi
+            //   | |
+            //   | |-- 00dc            : stream 0 Video Chunk
+            //   | |-- 01wb            : stream 1 Audio Chunk
+            //   | |-- 00dc
+            //   | |-- 01wb
+            //   | +-- ....
+            //   |
+            //   + idx1
+            //
+            // some avi files insert JUNK chunk before 'LIST - movi' to align 2048 bytes boundary.
+            // but I cant find any reason to align 2048 bytes boundary.
+
+            if (videoFormat == null) throw new ArgumentNullException("videoFormat");
+
+            int streams = audioFormat == null ? 1 : 2;
 
             // LISTチャンク'hdrl'を追加
-
             // 'hdrl' リストは AVI メイン ヘッダーで始まり、このメイン ヘッダーは 'avih' チャンクに含まれている。
             // メイン ヘッダーには、ファイル内のストリーム数、AVI シーケンスの幅と高さなど、AVI ファイル全体に関するグローバル情報が含まれる。
             // メイン ヘッダー チャンクは、AVIMAINHEADER 構造体で構成されている。
             {
                 var chunk = hdrlList.CreateChunk("avih");
                 var avih = new AVIMAINHEADER();
-                avih.dwMicroSecPerFrame = (uint)(1 / fps * 1000 * 1000);
+                avih.dwMicroSecPerFrame = (uint)(1 / videoFormat.FramesPerSec * 1000 * 1000);
                 avih.dwMaxBytesPerSec = 25000; // ffmpegと同じ値に
                 avih.dwFlags = 0x0910;         // ffmpegと同じ値に
-                avih.dwTotalFrames = (uint)frames;
+                avih.dwTotalFrames = (uint)videoFrames;
                 avih.dwStreams = (uint)streams;
                 avih.dwSuggestedBufferSize = 0x100000;
-                avih.dwWidth = (uint)width;
-                avih.dwHeight = (uint)height;
+                avih.dwWidth = (uint)videoFormat.Width;
+                avih.dwHeight = (uint)videoFormat.Height;
 
                 var data = StructureToBytes(avih);
                 chunk.Write(data);
@@ -99,38 +166,79 @@ namespace GitHub.secile.Avi
             // ビデオ ストリームの場合、この情報は必要に応じてパレット情報を含む BITMAPINFO 構造体である。オーディオ ストリームの場合、この情報は WAVEFORMATEX 構造体である。
 
             // Videoｽﾄﾘｰﾑ用の'strl'チャンク
-            var strl_list = hdrlList.CreateList("strl");
             {
-                var chunk = strl_list.CreateChunk("strh");
-                var strh = new AVISTREAMHEADER();
-                strh.fccType = ToFourCC("vids");
-                strh.fccHandler = ToFourCC(fourCC);
-                strh.dwScale = 1000 * 1000; // fps = dwRate / dwScale。秒間30フレームであることをあらわすのにdwScale=33333、dwRate=1000000という場合もあればdwScale=1、dwRate=30という場合もあります
-                strh.dwRate = (int)(fps * strh.dwScale);
-                strh.dwLength = frames;
-                strh.dwSuggestedBufferSize = 0x100000;
-                strh.dwQuality = -1;
+                var strl_list = hdrlList.CreateList("strl");
+                {
+                    var chunk = strl_list.CreateChunk("strh");
+                    var strh = new AVISTREAMHEADER();
+                    strh.fccType = ToFourCC("vids");
+                    strh.fccHandler = ToFourCC(fourCC);
+                    strh.dwScale = 1000 * 1000; // fps = dwRate / dwScale。秒間30フレームであることをあらわすのにdwScale=33333、dwRate=1000000という場合もあればdwScale=1、dwRate=30という場合もあります. For video streams, this is the frame rate. 
+                    strh.dwRate = (int)(videoFormat.FramesPerSec * strh.dwScale);
+                    strh.dwLength = videoFrames;
+                    strh.dwSuggestedBufferSize = 0x100000;
+                    strh.dwQuality = -1; // Quality is represented as a number between 0 and 10,000. If set to –1, drivers use the default quality value.
 
-                var data = StructureToBytes(strh);
-                chunk.Write(data);
-                chunk.Close();
+                    var data = StructureToBytes(strh);
+                    chunk.Write(data);
+                    chunk.Close();
+                }
+                {
+                    var chunk = strl_list.CreateChunk("strf");
+                    var strf = new BITMAPINFOHEADER();
+                    strf.biWidth = videoFormat.Width;
+                    strf.biHeight = videoFormat.Height;
+                    strf.biBitCount = 24;
+                    strf.biSizeImage = strf.biHeight * ((3 * strf.biWidth + 3) / 4) * 4; // らしい
+                    strf.biCompression = ToFourCC(fourCC);
+                    strf.biSize = System.Runtime.InteropServices.Marshal.SizeOf(strf);
+                    strf.biPlanes = 1;
+
+                    var data = StructureToBytes(strf);
+                    chunk.Write(data);
+                    chunk.Close();
+                }
+                strl_list.Close();
             }
+            
+            // Audioｽﾄﾘｰﾑ用の'strl'チャンク(あれば)
+            if (audioFormat != null)
             {
-                var chunk = strl_list.CreateChunk("strf");
-                var strf = new BITMAPINFOHEADER();
-                strf.biWidth = width;
-                strf.biHeight = height;
-                strf.biBitCount = 24;
-                strf.biSizeImage = strf.biHeight * ((3 * strf.biWidth + 3) / 4) * 4; // らしい
-                strf.biCompression = ToFourCC(fourCC);
-                strf.biSize = System.Runtime.InteropServices.Marshal.SizeOf(strf);
-                strf.biPlanes = 1;
+                var strl_list = hdrlList.CreateList("strl");
+                {
+                    var chunk = strl_list.CreateChunk("strh");
+                    var strh = new AVISTREAMHEADER();
+                    strh.fccType = ToFourCC("auds");
+                    strh.fccHandler = 0x00; // For audio and video streams, this specifies the codec for decoding the stream. pcmは不要。
+                    strh.dwScale = audioFormat.Channels;// For audio streams, this rate corresponds to the time needed to play nBlockAlign bytes of audio, which for PCM audio is the just the sample rate.
+                    strh.dwRate = audioFormat.SamplesPerSec * strh.dwScale; // Dividing dwRate by dwScale gives the number of samples per second.
+                    strh.dwSampleSize = (short)(audioFormat.Channels * (audioFormat.BitsPerSample / 8)); // For audio streams, this number should be the same as the nBlockAlign member of the WAVEFORMATEX structure describing the audio.
+                    strh.dwLength = audioFrames;
+                    strh.dwSuggestedBufferSize = strh.dwRate; // ?
+                    strh.dwQuality = -1; // Quality is represented as a number between 0 and 10,000. If set to –1, drivers use the default quality value.
 
-                var data = StructureToBytes(strf);
-                chunk.Write(data);
-                chunk.Close();
+                    var data = StructureToBytes(strh);
+                    chunk.Write(data);
+                    chunk.Close();
+                }
+                {
+                    const int WAVE_FORMAT_PCM = 0x0001;
+                    var chunk = strl_list.CreateChunk("strf");
+                    var strf = new WAVEFORMATEX();
+                    strf.nChannels = audioFormat.Channels;
+                    strf.wFormatTag = WAVE_FORMAT_PCM;
+                    strf.nSamplesPerSec = audioFormat.SamplesPerSec;
+                    strf.nBlockAlign = (short)(audioFormat.Channels * (audioFormat.BitsPerSample / 8));
+                    strf.nAvgBytesPerSec = strf.nSamplesPerSec * strf.nBlockAlign;
+                    strf.wBitsPerSample = audioFormat.BitsPerSample;
+                    strf.cbSize = 0;
+
+                    var data = StructureToBytes(strf);
+                    chunk.Write(data);
+                    chunk.Close();
+                }
+                strl_list.Close();
             }
-            strl_list.Close();
         }
 
         private class Idx1Entry
@@ -274,6 +382,19 @@ namespace GitHub.secile.Avi
             public Int32 biYPelsPerMeter;
             public Int32 biClrUsed;
             public Int32 biClrImportant;
+        }
+
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        private struct WAVEFORMATEX
+        {
+            public Int16 wFormatTag;
+            public Int16 nChannels;
+            public Int32 nSamplesPerSec;
+            public Int32 nAvgBytesPerSec;
+            public Int16 nBlockAlign;
+            public Int16 wBitsPerSample;
+            public Int16 cbSize;
         }
 
         #endregion
